@@ -3,7 +3,7 @@ import json
 import math
 from openai import OpenAI
 
-DASHSCOPE_API_KEY = "sk-438f12a1b211412ab6e9bcafde839e87"  
+DASHSCOPE_API_KEY = "update yours"  
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"  
 MODEL_NAME = "qwen3.7-max" 
 
