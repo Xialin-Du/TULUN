@@ -1,0 +1,1022 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from math import inf
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+import heapq
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib import animation
+from matplotlib.gridspec import GridSpec
+
+@dataclass(frozen=True)
+class PathMetrics:
+    delay_ms: float
+    bottleneck_bw_gbps: float
+    loss_rate: float
+
+
+@dataclass(frozen=True)
+class ScenarioResult:
+    demand_gbps: float
+    feasible_paths: List[List[str]]
+    allocation_paths: List[List[str]]
+    best_path: Optional[List[str]]
+    best_metrics: Optional[PathMetrics]
+    allocation: Dict[str, float]
+    stats: Dict[str, Any]
+
+
+def build_demo_network() -> nx.DiGraph:
+
+    G = nx.DiGraph()
+    G.add_nodes_from(["S", "A", "B", "C", "D", "E", "T"])
+
+    edges = [
+        ("S", "A", 0.18, 8.0, 0.002),
+        ("S", "B", 0.22, 7.0, 0.003),
+        ("A", "C", 0.20, 6.0, 0.002),
+        ("A", "D", 0.26, 5.0, 0.004),
+        ("A", "E", 0.28, 4.0, 0.004),
+        ("B", "D", 0.16, 5.5, 0.002),
+        ("B", "E", 0.24, 4.5, 0.003),
+        ("B", "C", 0.27, 4.5, 0.004),
+        ("C", "D", 0.09, 4.0, 0.001),
+        ("D", "C", 0.08, 4.0, 0.001),
+        ("E", "D", 0.07, 4.0, 0.001),
+        ("D", "T", 0.17, 5.0, 0.002),
+    ]
+    for u, v, d, bw, loss in edges:
+        G.add_edge(u, v, delay_ms=d, bw_gbps=bw, loss_rate=loss)
+    return G
+
+
+def path_metrics(G: nx.DiGraph, path: List[str]) -> PathMetrics:
+    delay = 0.0
+    bottleneck_bw = inf
+    loss_factor = 1.0
+    for u, v in zip(path[:-1], path[1:]):
+        data = G[u][v]
+        delay += float(data["delay_ms"])
+        bottleneck_bw = min(bottleneck_bw, float(data["bw_gbps"]))
+        loss_factor *= (1.0 - float(data["loss_rate"]))
+    return PathMetrics(
+        delay_ms=delay,
+        bottleneck_bw_gbps=bottleneck_bw,
+        loss_rate=1.0 - loss_factor,
+    )
+
+
+def feasible_path(
+    G: nx.DiGraph,
+    path: List[str],
+    demand_gbps: float,
+    delay_limit_ms: float,
+    loss_limit: float,
+    bandwidth_required: bool = True,
+) -> bool:
+    m = path_metrics(G, path)
+    bw_ok = m.bottleneck_bw_gbps >= demand_gbps if bandwidth_required else m.bottleneck_bw_gbps > 0
+    return (
+        m.delay_ms <= delay_limit_ms
+        and bw_ok
+        and m.loss_rate <= loss_limit
+    )
+
+
+def enumerate_feasible_paths(
+    G: nx.DiGraph,
+    source: str,
+    target: str,
+    demand_gbps: float,
+    delay_limit_ms: float,
+    loss_limit: float,
+    cutoff_hops: int = 8,
+    bandwidth_required: bool = True,
+) -> List[List[str]]:
+    paths: List[List[str]] = []
+    for path in nx.all_simple_paths(G, source=source, target=target, cutoff=cutoff_hops):
+        if feasible_path(
+            G,
+            path,
+            demand_gbps,
+            delay_limit_ms,
+            loss_limit,
+            bandwidth_required=bandwidth_required,
+        ):
+            paths.append(path)
+
+    paths.sort(key=lambda p: (path_metrics(G, p).delay_ms, len(p), p))
+    return paths
+
+
+def dominates(a: PathMetrics, b: PathMetrics) -> bool:
+
+    no_worse = (
+        a.delay_ms <= b.delay_ms
+        and a.bottleneck_bw_gbps >= b.bottleneck_bw_gbps
+        and a.loss_rate <= b.loss_rate
+    )
+    strictly_better = (
+        a.delay_ms < b.delay_ms
+        or a.bottleneck_bw_gbps > b.bottleneck_bw_gbps
+        or a.loss_rate < b.loss_rate
+    )
+    return no_worse and strictly_better
+
+
+def modified_dijkstra(
+    G: nx.DiGraph,
+    source: str,
+    target: str,
+    demand_gbps: float,
+    delay_limit_ms: float,
+    loss_limit: float,
+) -> Tuple[Optional[List[str]], List[Tuple[List[str], PathMetrics]]]:
+
+    labels: Dict[str, List[Tuple[PathMetrics, List[str]]]] = {n: [] for n in G.nodes}
+    pq: List[Tuple[float, str, PathMetrics, List[str]]] = []
+
+    start_metrics = PathMetrics(0.0, inf, 0.0)
+    heapq.heappush(pq, (0.0, source, start_metrics, [source]))
+    labels[source].append((start_metrics, [source]))
+
+    accepted_target: List[Tuple[List[str], PathMetrics]] = []
+
+    while pq:
+        _, node, met, path = heapq.heappop(pq)
+
+        if any(existing_met != met and dominates(existing_met, met) for existing_met, _ in labels[node]):
+            continue
+
+        if node == target:
+            if met.delay_ms <= delay_limit_ms and met.bottleneck_bw_gbps >= demand_gbps and met.loss_rate <= loss_limit:
+                accepted_target.append((path, met))
+            continue
+
+        for nbr in G.successors(node):
+            if nbr in path:
+                continue  
+
+            data = G[node][nbr]
+            new_delay = met.delay_ms + float(data["delay_ms"])
+            new_bw = min(met.bottleneck_bw_gbps, float(data["bw_gbps"]))
+            new_loss = 1.0 - (1.0 - met.loss_rate) * (1.0 - float(data["loss_rate"]))
+            new_met = PathMetrics(new_delay, new_bw, new_loss)
+
+            if new_delay > delay_limit_ms or new_bw < demand_gbps or new_loss > loss_limit:
+                continue
+
+            keep = True
+            pruned: List[Tuple[PathMetrics, List[str]]] = []
+            for ex_met, ex_path in labels[nbr]:
+                if dominates(ex_met, new_met):
+                    keep = False
+                    break
+                if not dominates(new_met, ex_met):
+                    pruned.append((ex_met, ex_path))
+            if not keep:
+                continue
+
+            new_path = path + [nbr]
+            pruned.append((new_met, new_path))
+            labels[nbr] = pruned
+            heapq.heappush(pq, (new_delay, nbr, new_met, new_path))
+
+    if not accepted_target:
+        return None, []
+
+    accepted_target.sort(key=lambda x: (x[1].delay_ms, len(x[0]), x[0]))
+    return accepted_target[0][0], accepted_target
+
+
+def path_based_min_cost_allocation(
+    G: nx.DiGraph,
+    candidate_paths: List[List[str]],
+    demand_gbps: float,
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
+
+    if not candidate_paths:
+        raise ValueError("No feasible candidate paths found.")
+
+    H = nx.DiGraph()
+    s = "SUPER_SOURCE"
+    t = "SUPER_SINK"
+
+    demand_units = int(round(demand_gbps * 1000))
+    H.add_node(s, demand=-demand_units)
+    H.add_node(t, demand=demand_units)
+
+    for i, path in enumerate(candidate_paths):
+        node = f"PATH_{i + 1}"
+        met = path_metrics(G, path)
+        cap_units = int(round(met.bottleneck_bw_gbps * 1000))
+        cost_units = int(round(met.delay_ms * 1000))
+        H.add_node(node, demand=0)
+        H.add_edge(s, node, capacity=cap_units, weight=cost_units)
+        H.add_edge(node, t, capacity=cap_units, weight=0)
+
+    try:
+        flow = nx.min_cost_flow(H)
+    except nx.NetworkXUnfeasible as exc:
+        raise ValueError("Traffic demand cannot be satisfied by the feasible paths.") from exc
+
+    allocation: Dict[str, float] = {}
+    path_stats: Dict[str, Any] = {}
+    total_alloc = 0.0
+    total_cost = 0.0
+
+    for i, path in enumerate(candidate_paths):
+        node = f"PATH_{i + 1}"
+        allocated = flow[s][node] / 1000.0
+        key = " -> ".join(path)
+        met = path_metrics(G, path)
+        allocation[key] = allocated
+        path_stats[key] = {
+            "delay_ms": met.delay_ms,
+            "loss_rate": met.loss_rate,
+            "bottleneck_bw_gbps": met.bottleneck_bw_gbps,
+            "allocated_gbps": allocated,
+            "weighted_delay_cost_ms_gbps": allocated * met.delay_ms,
+        }
+        total_alloc += allocated
+        total_cost += allocated * met.delay_ms
+
+    path_stats["TOTAL"] = {
+        "allocated_gbps": total_alloc,
+        "total_weighted_delay_ms_gbps": total_cost,
+    }
+    return allocation, path_stats
+
+
+def feasible_critical_edges(feasible_paths: List[List[str]]) -> List[Tuple[str, str]]:
+
+    if not feasible_paths:
+        return []
+
+    edge_count: Dict[Tuple[str, str], int] = {}
+    for path in feasible_paths:
+        for e in zip(path[:-1], path[1:]):
+            edge_count[e] = edge_count.get(e, 0) + 1
+
+    return sorted([e for e, c in edge_count.items() if c == len(feasible_paths)])
+
+
+def best_path_under_failure(
+    G: nx.DiGraph,
+    source: str,
+    target: str,
+    demand_gbps: float,
+    delay_limit_ms: float,
+    loss_limit: float,
+    avoid_edge: Optional[Tuple[str, str]] = None,
+    avoid_node: Optional[str] = None,
+) -> Optional[List[str]]:
+    H = G.copy()
+    if avoid_edge is not None and H.has_edge(*avoid_edge):
+        H.remove_edge(*avoid_edge)
+    if avoid_node is not None and H.has_node(avoid_node):
+        if avoid_node not in (source, target):
+            H.remove_node(avoid_node)
+
+    paths = enumerate_feasible_paths(H, source, target, demand_gbps, delay_limit_ms, loss_limit)
+    return paths[0] if paths else None
+
+
+def top_allocated_paths(allocation: Dict[str, float], top_n: int = 2) -> List[List[str]]:
+    items = [(path, value) for path, value in allocation.items() if value > 1e-9]
+    items.sort(key=lambda kv: (kv[1], kv[0]), reverse=True)
+    return [path.split(" -> ") for path, _ in items[:top_n]]
+
+
+def run_case(
+    G: nx.DiGraph,
+    source: str,
+    target: str,
+    demand_gbps: float,
+    delay_limit_ms: float,
+    loss_limit: float,
+) -> ScenarioResult:
+    feasible_paths = enumerate_feasible_paths(
+        G,
+        source,
+        target,
+        demand_gbps,
+        delay_limit_ms,
+        loss_limit,
+        bandwidth_required=True,
+    )
+
+    allocation_paths = enumerate_feasible_paths(
+        G,
+        source,
+        target,
+        0.0,
+        delay_limit_ms,
+        loss_limit,
+        bandwidth_required=False,
+    )
+
+    best_path = feasible_paths[0] if feasible_paths else None
+    best_metrics = path_metrics(G, best_path) if best_path else None
+    allocation, stats = path_based_min_cost_allocation(G, allocation_paths, demand_gbps)
+    return ScenarioResult(
+        demand_gbps=demand_gbps,
+        feasible_paths=feasible_paths,
+        allocation_paths=allocation_paths,
+        best_path=best_path,
+        best_metrics=best_metrics,
+        allocation=allocation,
+        stats=stats,
+    )
+
+
+def draw_network_topology(
+    G: nx.DiGraph,
+    primary_path: Optional[List[str]],
+    backup_path: Optional[List[str]],
+    out_path: Path,
+    title: str,
+    failed_edge: Optional[Tuple[str, str]] = None,
+    failed_node: Optional[str] = None,
+) -> None:
+    fig, ax = plt.subplots(figsize=(15, 8.5), constrained_layout=True)
+    ax.set_title(title, fontsize=18, pad=16, fontweight="bold")
+
+    pos = {
+        "S": (0.0, 0.5),
+        "A": (1.0, 1.25),
+        "B": (1.0, -0.15),
+        "C": (2.3, 1.25),
+        "D": (2.3, 0.10),
+        "E": (2.3, -1.0),
+        "T": (3.7, 0.35),
+    }
+
+    all_edges = list(G.edges())
+    edge_colors = ["#c9c9c9"] * len(all_edges)
+    edge_styles = ["solid"] * len(all_edges)
+    edge_widths = [1.2] * len(all_edges)
+
+    def mark_edge(edge: Tuple[str, str], color: str, width: float = 4.0, style: str = "solid") -> None:
+        if edge in all_edges:
+            idx = all_edges.index(edge)
+            edge_colors[idx] = color
+            edge_widths[idx] = width
+            edge_styles[idx] = style
+
+    if primary_path:
+        for e in zip(primary_path[:-1], primary_path[1:]):
+            mark_edge(e, "#d62728", 4.5)
+    if backup_path:
+        for e in zip(backup_path[:-1], backup_path[1:]):
+            if primary_path and e in list(zip(primary_path[:-1], primary_path[1:])):
+                continue
+            mark_edge(e, "#2ca02c", 3.8)
+
+    if failed_edge is not None:
+        mark_edge(failed_edge, "#7f7f7f", 4.0, "dashed")
+
+    for (u, v), color, width, style in zip(all_edges, edge_colors, edge_widths, edge_styles):
+        alpha = 0.95 if color != "#c9c9c9" else 0.55
+        nx.draw_networkx_edges(
+            G,
+            pos,
+            edgelist=[(u, v)],
+            ax=ax,
+            edge_color=color,
+            width=width,
+            style=style,
+            alpha=alpha,
+            arrows=True,
+            arrowsize=18,
+            min_source_margin=14,
+            min_target_margin=14,
+            connectionstyle="arc3,rad=0.0",
+        )
+
+    node_colors = []
+    for n in G.nodes():
+        if n == "S":
+            node_colors.append("#ffb347")
+        elif n == "T":
+            node_colors.append("#c77dff")
+        else:
+            node_colors.append("#4c78a8")
+
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        ax=ax,
+        node_color=node_colors,
+        node_size=2100,
+        edgecolors="#1f1f1f",
+        linewidths=1.2,
+    )
+    nx.draw_networkx_labels(
+        G,
+        pos,
+        ax=ax,
+        font_size=13,
+        font_weight="bold",
+        font_color="#111111",
+    )
+
+    edge_labels = {
+        (u, v): f"d={d['delay_ms']:.2f} ms\nb={d['bw_gbps']:.1f} Gbps\nl={d['loss_rate']:.3f}"
+        for u, v, d in G.edges(data=True)
+    }
+    nx.draw_networkx_edge_labels(
+        G,
+        pos,
+        edge_labels=edge_labels,
+        font_size=8,
+        rotate=False,
+        bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="#dddddd", alpha=0.80),
+        ax=ax,
+    )
+
+    legend_items = [
+        Line2D([0], [0], color="#d62728", lw=4.5, label="Primary path"),
+        Line2D([0], [0], color="#2ca02c", lw=3.8, label="Backup path"),
+        Line2D([0], [0], color="#7f7f7f", lw=4.0, linestyle="--", label="Failed link"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#ffb347", markeredgecolor="#1f1f1f", markersize=12, label="Source"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#c77dff", markeredgecolor="#1f1f1f", markersize=12, label="Target"),
+    ]
+    ax.legend(handles=legend_items, loc="upper left", frameon=True, framealpha=0.95)
+
+    if failed_node is not None:
+        ax.text(
+            0.02,
+            0.03,
+            f"Failed node removed: {failed_node}",
+            transform=ax.transAxes,
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.25", fc="#fff4e6", ec="#f0b15a", alpha=0.95),
+        )
+    if failed_edge is not None:
+        ax.text(
+            0.02,
+            0.08,
+            f"Failed edge removed: {failed_edge[0]} -> {failed_edge[1]}",
+            transform=ax.transAxes,
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.25", fc="#f6f6f6", ec="#a0a0a0", alpha=0.95),
+        )
+
+    ax.set_axis_off()
+    fig.savefig(out_path, dpi=240, bbox_inches="tight")
+    plt.close(fig)
+
+
+def draw_allocation_barh(
+    allocation: Dict[str, float],
+    G: nx.DiGraph,
+    out_path: Path,
+    title: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(14, 7.5), constrained_layout=True)
+
+    items = list(allocation.items())
+    items.sort(key=lambda kv: (kv[1], kv[0]), reverse=True)
+
+    labels = [k for k, _ in items]
+    values = [v for _, v in items]
+    delays = [path_metrics(G, label.split(" -> ")).delay_ms for label in labels]
+    max_delay = max(delays) if delays else 1.0
+
+    cmap = plt.get_cmap("viridis")
+    colors = [cmap(d / max_delay) for d in delays]
+
+    bars = ax.barh(range(len(labels)), values, color=colors, edgecolor="#1f1f1f", linewidth=0.6)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontsize=10)
+    ax.invert_yaxis()
+    ax.set_xlabel("Allocated Traffic (Gbps)", fontsize=11)
+    ax.set_title(title, fontsize=18, pad=14, fontweight="bold")
+
+    for bar, val, d in zip(bars, values, delays):
+        ax.text(
+            bar.get_width() + max(values) * 0.015,
+            bar.get_y() + bar.get_height() / 2,
+            f"{val:.2f} Gbps   ({d:.2f} ms)",
+            va="center",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+    ax.grid(axis="x", linestyle="--", alpha=0.25)
+    ax.set_facecolor("#fbfbfb")
+    fig.savefig(out_path, dpi=240, bbox_inches="tight")
+    plt.close(fig)
+
+
+def draw_failure_summary(
+    nominal: Optional[List[str]],
+    recovered: Optional[List[str]],
+    out_path: Path,
+    title: str,
+    metric_name: str = "Delay (ms)",
+) -> None:
+    fig, ax = plt.subplots(figsize=(8.8, 5.2), constrained_layout=True)
+    ax.set_title(title, fontsize=16, pad=12, fontweight="bold")
+
+    labels = ["Nominal", "Recovered"]
+    values = []
+    for p in [nominal, recovered]:
+        if p is None:
+            values.append(0.0)
+        else:
+            values.append(None)  
+
+    ax.bar([0, 1], [1, 1], alpha=0.0)  
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(labels, fontsize=11)
+    ax.set_ylabel(metric_name, fontsize=11)
+
+    for idx, path in enumerate([nominal, recovered]):
+        if path is None:
+            txt = "No feasible backup"
+            box_fc = "#ffe6e6"
+            value = 0.0
+        else:
+            value = 0.0
+            txt = " -> ".join(path)
+            box_fc = "#eef6ff"
+
+        ax.text(
+            idx,
+            0.55,
+            txt,
+            ha="center",
+            va="center",
+            fontsize=10,
+            wrap=True,
+            bbox=dict(boxstyle="round,pad=0.35", fc=box_fc, ec="#d0d0d0", alpha=0.96),
+        )
+
+    ax.set_ylim(0, 1)
+    ax.set_yticks([])
+    ax.grid(False)
+    fig.savefig(out_path, dpi=240, bbox_inches="tight")
+    plt.close(fig)
+
+
+def animate_path_selection(
+    G: nx.DiGraph,
+    candidate_paths: List[List[str]],
+    out_path: Path,
+    title: str,
+    subtitle: str,
+    highlight_path: Optional[List[str]] = None,
+    final_note: Optional[str] = None,
+) -> None:
+
+    if not candidate_paths:
+        return
+
+    ordered = sorted(candidate_paths, key=lambda p: (path_metrics(G, p).delay_ms, len(p), p))
+    pos = {
+        "S": (0.0, 0.5),
+        "A": (1.0, 1.25),
+        "B": (1.0, -0.15),
+        "C": (2.3, 1.25),
+        "D": (2.3, 0.10),
+        "E": (2.3, -1.0),
+        "T": (3.7, 0.35),
+    }
+
+    fig = plt.figure(figsize=(15.8, 8.8), constrained_layout=True)
+    fig.patch.set_facecolor("#ffffff")
+    gs = GridSpec(2, 2, figure=fig, width_ratios=[2.35, 1.0], height_ratios=[1.0, 1.0], wspace=0.08, hspace=0.15)
+
+    ax_graph = fig.add_subplot(gs[:, 0])
+    ax_rank = fig.add_subplot(gs[0, 1])
+    ax_info = fig.add_subplot(gs[1, 1])
+
+    def draw_base_graph() -> None:
+        ax_graph.clear()
+        ax_graph.set_title(title, fontsize=20, pad=18, fontweight="bold")
+        ax_graph.text(
+            0.5,
+            1.02,
+            subtitle,
+            transform=ax_graph.transAxes,
+            ha="center",
+            va="bottom",
+            fontsize=11,
+            color="#555555",
+        )
+
+        for u, v, data in G.edges(data=True):
+            nx.draw_networkx_edges(
+                G,
+                pos,
+                edgelist=[(u, v)],
+                ax=ax_graph,
+                edge_color="#d9d9d9",
+                width=1.25,
+                alpha=0.7,
+                arrows=True,
+                arrowsize=18,
+                min_source_margin=14,
+                min_target_margin=14,
+                connectionstyle="arc3,rad=0.0",
+            )
+
+        node_colors = []
+        for n in G.nodes():
+            if n == "S":
+                node_colors.append("#ffb347")
+            elif n == "T":
+                node_colors.append("#c77dff")
+            else:
+                node_colors.append("#4c78a8")
+
+        nx.draw_networkx_nodes(
+            G,
+            pos,
+            ax=ax_graph,
+            node_color=node_colors,
+            node_size=2200,
+            edgecolors="#1f1f1f",
+            linewidths=1.25,
+        )
+        nx.draw_networkx_labels(
+            G,
+            pos,
+            ax=ax_graph,
+            font_size=13,
+            font_weight="bold",
+            font_color="#111111",
+        )
+
+        edge_labels = {
+            (u, v): f"d={d['delay_ms']:.2f} ms\nb={d['bw_gbps']:.1f} Gbps\nl={d['loss_rate']:.3f}"
+            for u, v, d in G.edges(data=True)
+        }
+        nx.draw_networkx_edge_labels(
+            G,
+            pos,
+            edge_labels=edge_labels,
+            font_size=8,
+            rotate=False,
+            bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="#dddddd", alpha=0.82),
+            ax=ax_graph,
+        )
+
+        ax_graph.set_axis_off()
+
+    def draw_path(path: Optional[List[str]], color: str, width: float, alpha: float = 1.0, style: str = "solid") -> None:
+        if not path:
+            return
+        nx.draw_networkx_edges(
+            G,
+            pos,
+            edgelist=list(zip(path[:-1], path[1:])),
+            ax=ax_graph,
+            edge_color=color,
+            width=width,
+            alpha=alpha,
+            style=style,
+            arrows=True,
+            arrowsize=20,
+            min_source_margin=14,
+            min_target_margin=14,
+            connectionstyle="arc3,rad=0.0",
+        )
+
+    def update(frame_idx: int) -> None:
+        draw_base_graph()
+
+        final_frame = frame_idx >= len(ordered)
+        inspected = ordered[: min(frame_idx, len(ordered))]
+        current = None if final_frame else ordered[frame_idx]
+        ranked_best = ordered[0]
+        selected = highlight_path if highlight_path is not None else ranked_best
+
+        for p in inspected:
+            if p == selected and not final_frame:
+                continue
+            draw_path(p, "#9aa0a6", 2.0, alpha=0.22)
+
+        if current is not None:
+            draw_path(current, "#f39c12", 4.4, alpha=0.95)
+
+        if final_frame:
+            if highlight_path is not None:
+                draw_path(highlight_path, "#d62728", 5.2, alpha=0.98)
+            else:
+                draw_path(ranked_best, "#2ca02c", 5.0, alpha=0.98)
+        else:
+            current_best = min(ordered[: frame_idx + 1], key=lambda p: (path_metrics(G, p).delay_ms, len(p), p))
+            draw_path(current_best, "#d62728", 4.9, alpha=0.98)
+
+        ax_rank.clear()
+        ax_rank.set_facecolor("#fcfcfc")
+        ax_rank.axis("off")
+        ax_rank.text(0.02, 0.98, "Candidate Ranking", fontsize=14, fontweight="bold", va="top")
+        y = 0.88
+        for i, p in enumerate(ordered):
+            met = path_metrics(G, p)
+            tag = "★" if p == selected else " "
+            pointer = "▶" if (current is not None and p == current) else " "
+            if final_frame and i == 0 and highlight_path is None:
+                pointer = "✓"
+            line = f"{pointer} {i+1}. {tag} { ' -> '.join(p) }"
+            ax_rank.text(
+                0.02,
+                y,
+                line,
+                fontsize=10,
+                family="DejaVu Sans",
+                va="top",
+                color="#111111",
+            )
+            ax_rank.text(
+                0.06,
+                y - 0.06,
+                f"delay={met.delay_ms:.2f} ms, bw={met.bottleneck_bw_gbps:.1f} Gbps, loss={met.loss_rate:.4f}",
+                fontsize=9,
+                color="#4f4f4f",
+                va="top",
+            )
+            y -= 0.18
+            if y < 0.08:
+                break
+
+        ax_info.clear()
+        ax_info.set_facecolor("#fcfcfc")
+        ax_info.axis("off")
+
+        if current is not None:
+            met = path_metrics(G, current)
+            decision = "accepted as current best" if current == min(ordered[: frame_idx + 1], key=lambda p: (path_metrics(G, p).delay_ms, len(p), p)) else "kept as a feasible candidate"
+            info_title = f"Step {frame_idx + 1} / {len(ordered)}"
+            path_text = " -> ".join(current)
+            info_lines = [
+                (info_title, "#111111", "#ffffff"),
+                (f"Current candidate: {path_text}", "#0b3d91", "#eef4ff"),
+                (f"Delay: {met.delay_ms:.2f} ms", "#111111", "#ffffff"),
+                (f"Bottleneck bandwidth: {met.bottleneck_bw_gbps:.1f} Gbps", "#111111", "#ffffff"),
+                (f"Packet loss: {met.loss_rate:.4f}", "#111111", "#ffffff"),
+                (f"Decision: {decision}", "#111111", "#ffffff"),
+            ]
+        else:
+            if highlight_path is not None:
+                met = path_metrics(G, highlight_path)
+                info_lines = [
+                    ("Final selection", "#111111", "#ffffff"),
+                    (f"Selected path: {' -> '.join(highlight_path)}", "#b22222", "#fff0f0"),
+                    (f"Delay: {met.delay_ms:.2f} ms", "#111111", "#ffffff"),
+                    (f"Bottleneck bandwidth: {met.bottleneck_bw_gbps:.1f} Gbps", "#111111", "#ffffff"),
+                    (f"Packet loss: {met.loss_rate:.4f}", "#111111", "#ffffff"),
+                    ((final_note or "Selected as the optimal feasible path."), "#111111", "#ffffff"),
+                ]
+            else:
+                met = path_metrics(G, ranked_best)
+                info_lines = [
+                    ("Congestion summary", "#111111", "#ffffff"),
+                    (f"Reference path: {' -> '.join(ranked_best)}", "#1b7f3a", "#f1fff4"),
+                    (f"Delay: {met.delay_ms:.2f} ms", "#111111", "#ffffff"),
+                    (f"Bottleneck bandwidth: {met.bottleneck_bw_gbps:.1f} Gbps", "#111111", "#ffffff"),
+                    (f"Packet loss: {met.loss_rate:.4f}", "#111111", "#ffffff"),
+                    ((final_note or "No single path can satisfy the full demand."), "#111111", "#ffffff"),
+                ]
+
+        y0 = 0.96
+        for idx, (txt, txt_color, box_fc) in enumerate(info_lines):
+            fontsize = 14 if idx == 0 else 11
+            weight = "bold" if idx in (0, 1) else "normal"
+            ax_info.text(
+                0.02,
+                y0,
+                txt,
+                transform=ax_info.transAxes,
+                ha="left",
+                va="top",
+                fontsize=fontsize,
+                fontweight=weight,
+                color=txt_color,
+                bbox=dict(boxstyle="round,pad=0.35", fc=box_fc, ec="#d0d0d0", alpha=0.96),
+            )
+            y0 -= 0.15 if idx == 0 else 0.13
+
+    frames = list(range(len(ordered))) + [len(ordered)] * 2
+    anim = animation.FuncAnimation(fig, update, frames=frames, interval=1200, repeat=False)
+    writer = animation.PillowWriter(fps=1)
+    anim.save(out_path, writer=writer)
+    plt.close(fig)
+
+def describe_case(
+    name: str,
+    result: ScenarioResult,
+    G: nx.DiGraph,
+) -> None:
+    print(f"\n=== {name} ===")
+    print(f"Demand: {result.demand_gbps:.2f} Gbps")
+    print(f"Single-path feasible routes: {len(result.feasible_paths)}")
+    print(f"Allocation candidate routes: {len(result.allocation_paths)}")
+
+    if result.best_path is None or result.best_metrics is None:
+        print("No single path can carry the full demand; traffic will be split across multiple admissible paths.")
+    else:
+        print("Best feasible path:", " -> ".join(result.best_path))
+        print(f"  Delay: {result.best_metrics.delay_ms:.2f} ms")
+        print(f"  Bottleneck bandwidth: {result.best_metrics.bottleneck_bw_gbps:.1f} Gbps")
+        print(f"  Packet loss: {result.best_metrics.loss_rate:.4f}")
+
+    print("Min-cost allocation:")
+    for p, f in result.allocation.items():
+        if f > 1e-9:
+            met = path_metrics(G, p.split(" -> "))
+            print(
+                f"  {p}: {f:.3f} Gbps "
+                f"(delay={met.delay_ms:.2f} ms, bottleneck={met.bottleneck_bw_gbps:.1f} Gbps)"
+            )
+    print(f"  Total allocated: {result.stats['TOTAL']['allocated_gbps']:.3f} Gbps")
+    print(f"  Total weighted delay: {result.stats['TOTAL']['total_weighted_delay_ms_gbps']:.3f} ms·Gbps")
+
+
+def main() -> None:
+    G = build_demo_network()
+
+    source = "S"
+    target = "T"
+    delay_limit_ms = 1.0
+    loss_limit = 0.02
+
+    out_dir = Path("graph_theory_project_outputs_v3")
+    out_dir.mkdir(exist_ok=True)
+
+    print("=== Input parameters ===")
+    print(f"source = {source}, target = {target}")
+    print(f"delay limit = {delay_limit_ms:.2f} ms")
+    print(f"loss limit = {loss_limit:.3f}")
+
+    case_nominal = run_case(G, source, target, demand_gbps=3.0, delay_limit_ms=delay_limit_ms, loss_limit=loss_limit)
+
+    case_congested = run_case(G, source, target, demand_gbps=8.0, delay_limit_ms=delay_limit_ms, loss_limit=loss_limit)
+
+    describe_case("Case 1: Nominal demand", case_nominal, G)
+    describe_case("Case 2: Congestion-aware demand", case_congested, G)
+
+    print("\n=== Critical links among allocation paths (congested case) ===")
+    critical = feasible_critical_edges(case_congested.allocation_paths)
+    if critical:
+        for u, v in critical:
+            print(f"  {u} -> {v}")
+    else:
+        print("  No critical links.")
+
+    primary = case_congested.best_path if case_congested.best_path is not None else (case_congested.allocation_paths[0] if case_congested.allocation_paths else None)
+    if primary is not None:
+        primary_edges = list(zip(primary[:-1], primary[1:]))
+        recoverable_edge = ("B", "D") if G.has_edge("B", "D") else (primary_edges[0] if primary_edges else ("S", "A"))
+
+        recovered_from_edge = best_path_under_failure(
+            G, source, target, 8.0, delay_limit_ms, loss_limit, avoid_edge=recoverable_edge
+        )
+        recovered_from_node = best_path_under_failure(
+            G, source, target, 8.0, delay_limit_ms, loss_limit, avoid_node="B"
+        )
+        critical_fail = best_path_under_failure(
+            G, source, target, 8.0, delay_limit_ms, loss_limit, avoid_edge=("D", "T")
+        )
+
+        print("\n=== Failure recovery checks (congested case) ===")
+        print(f"Edge failure {recoverable_edge[0]} -> {recoverable_edge[1]}:")
+        print(" ", "No single-path backup" if recovered_from_edge is None else " -> ".join(recovered_from_edge))
+        print("Node failure B:")
+        print(" ", "No single-path backup" if recovered_from_node is None else " -> ".join(recovered_from_node))
+        print("Critical edge failure D -> T:")
+        print(" ", "No single-path backup" if critical_fail is None else " -> ".join(critical_fail))
+
+        H_edge = G.copy()
+        if H_edge.has_edge(*recoverable_edge):
+            H_edge.remove_edge(*recoverable_edge)
+        failed_case_edge = run_case(H_edge, source, target, demand_gbps=8.0, delay_limit_ms=delay_limit_ms, loss_limit=loss_limit)
+
+        H_node = G.copy()
+        if H_node.has_node("B"):
+            H_node.remove_node("B")
+        failed_case_node = run_case(H_node, source, target, demand_gbps=8.0, delay_limit_ms=delay_limit_ms, loss_limit=loss_limit)
+
+        draw_network_topology(
+            G,
+            primary_path=case_nominal.best_path,
+            backup_path=case_nominal.feasible_paths[1] if len(case_nominal.feasible_paths) > 1 else None,
+            out_path=out_dir / "network_topology_nominal.png",
+            title="Network Topology with Primary and Backup Paths",
+        )
+        draw_allocation_barh(
+            case_nominal.allocation,
+            G,
+            out_dir / "traffic_allocation_nominal.png",
+            "Traffic Allocation Under Nominal Demand",
+        )
+        draw_allocation_barh(
+            case_congested.allocation,
+            G,
+            out_dir / "traffic_allocation_split.png",
+            "Traffic Allocation Under Congestion-Aware Demand",
+        )
+
+        edge_top_paths = top_allocated_paths(failed_case_edge.allocation, top_n=2)
+        node_top_paths = top_allocated_paths(failed_case_node.allocation, top_n=2)
+
+        edge_backup = edge_top_paths[0] if edge_top_paths else None
+        node_backup = node_top_paths[0] if node_top_paths else None
+
+        draw_network_topology(
+            G,
+            primary_path=primary,
+            backup_path=edge_backup,
+            out_path=out_dir / "edge_failure_reroute.png",
+            title="Edge Failure Recovery and Rerouting",
+            failed_edge=recoverable_edge,
+        )
+        draw_network_topology(
+            G,
+            primary_path=primary,
+            backup_path=node_backup,
+            out_path=out_dir / "node_failure_reroute.png",
+            title="Node Failure Recovery and Rerouting",
+            failed_node="B",
+        )
+
+        draw_allocation_barh(
+            failed_case_edge.allocation,
+            G,
+            out_dir / "traffic_allocation_after_edge_failure.png",
+            "Traffic Allocation After Edge Failure",
+        )
+        draw_allocation_barh(
+            failed_case_node.allocation,
+            G,
+            out_dir / "traffic_allocation_after_node_failure.png",
+            "Traffic Allocation After Node Failure",
+        )
+
+        draw_failure_summary(
+            primary,
+            edge_backup,
+            out_dir / "edge_failure_summary.png",
+            "Edge Failure Recovery Summary",
+        )
+        draw_failure_summary(
+            primary,
+            node_backup,
+            out_dir / "node_failure_summary.png",
+            "Node Failure Recovery Summary",
+        )
+
+        animate_path_selection(
+            G,
+            case_nominal.feasible_paths,
+            out_dir / "path_selection_nominal.gif",
+            title="Path Selection Animation",
+            subtitle="Nominal demand: the algorithm inspects feasible paths and selects the lowest-delay route.",
+            highlight_path=case_nominal.best_path,
+            final_note="Selected as the optimal feasible path.",
+        )
+
+        animate_path_selection(
+            G,
+            case_congested.allocation_paths,
+            out_dir / "path_selection_congested.gif",
+            title="Path Ranking Under Congestion",
+            subtitle="Congestion-aware demand: no single path can satisfy the full demand, so traffic must be split.",
+            highlight_path=None,
+            final_note="No single path can satisfy the full demand; use min-cost multi-path allocation.",
+        )
+
+        print("\n=== After edge failure, re-allocated traffic ===")
+        for p, f in failed_case_edge.allocation.items():
+            if f > 1e-9:
+                met = path_metrics(H_edge, p.split(" -> "))
+                print(
+                    f"  {p}: {f:.3f} Gbps "
+                    f"(delay={met.delay_ms:.2f} ms, bottleneck={met.bottleneck_bw_gbps:.1f} Gbps)"
+                )
+        print(f"  Total allocated: {failed_case_edge.stats['TOTAL']['allocated_gbps']:.3f} Gbps")
+
+        print("\n=== After node failure, re-allocated traffic ===")
+        for p, f in failed_case_node.allocation.items():
+            if f > 1e-9:
+                met = path_metrics(H_node, p.split(" -> "))
+                print(
+                    f"  {p}: {f:.3f} Gbps "
+                    f"(delay={met.delay_ms:.2f} ms, bottleneck={met.bottleneck_bw_gbps:.1f} Gbps)"
+                )
+        print(f"  Total allocated: {failed_case_node.stats['TOTAL']['allocated_gbps']:.3f} Gbps")
+
+    else:
+        print("No primary path available for failure analysis.")
+
+    print("\nFigures saved to:", out_dir.resolve())
+
+
+if __name__ == "__main__":
+    main()
